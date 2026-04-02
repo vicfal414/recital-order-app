@@ -254,11 +254,22 @@ if uploaded_file:
             if error:
                 st.markdown(f'<div class="error-box">⚠️ {error}</div>', unsafe_allow_html=True)
             else:
-                st.markdown('<div class="success-box">✓ Schedule generated successfully!</div>', unsafe_allow_html=True)
-
-                # --- Downloads ---
+                # --- Check for invalid quick changes before anything else ---
                 json_output = json.dumps({"Part 1": result["Part 1"], "Part 2": result["Part 2"]}, indent=4)
                 report_output = generate_quick_change_report(result)
+
+                has_invalid = "**INVALID/ERROR**" in report_output
+
+                if has_invalid:
+                    st.markdown(
+                        '<div class="error-box">'
+                        '⚠️ <strong>Invalid Quick Change Detected!</strong> This schedule contains one or more students '
+                        'with an invalid gap between performances. Please click <em>Generate Schedule</em> again to try a new order.'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown('<div class="success-box">✓ Schedule generated successfully! No invalid quick changes detected.</div>', unsafe_allow_html=True)
 
                 col1, col2 = st.columns(2)
                 with col1:
