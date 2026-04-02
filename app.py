@@ -277,22 +277,21 @@ if uploaded_file:
                     )
 
                 # --- Display Order ---
-                def render_order_list(routines):
-                    lines = "\n".join(
-                        f"{r['order']}. {r['className']}" for r in routines
-                    )
-                    st.markdown(
-                        f"<pre style='font-family: \"Lato\", monospace; font-size: 0.95rem; "
-                        f"background: #faf8f6; border: 1px solid #e8e0d8; border-radius: 6px; "
-                        f"padding: 18px 22px; line-height: 1.8; color: #2c2c2c;'>{lines}</pre>",
-                        unsafe_allow_html=True
-                    )
-
                 st.markdown('<div class="part-header">Part 1</div>', unsafe_allow_html=True)
-                render_order_list(result["Part 1"])
+                p1_rows = [{"#": r["order"], "Class Name": r["className"]} for r in result["Part 1"]]
+                st.dataframe(pd.DataFrame(p1_rows), use_container_width=True, hide_index=True)
 
                 st.markdown('<div class="part-header">Part 2</div>', unsafe_allow_html=True)
-                render_order_list(result["Part 2"])
+                p2_rows = [{"#": r["order"], "Class Name": r["className"]} for r in result["Part 2"]]
+                st.dataframe(pd.DataFrame(p2_rows), use_container_width=True, hide_index=True)
+
+                # --- Copyable List ---
+                st.markdown('<div class="part-header">Copy as List</div>', unsafe_allow_html=True)
+                all_lines = ["--- Part 1 ---"]
+                all_lines += [f"{r['order']}. {r['className']}" for r in result["Part 1"]]
+                all_lines += ["", "--- Part 2 ---"]
+                all_lines += [f"{r['order']}. {r['className']}" for r in result["Part 2"]]
+                st.text_area("", value="\n".join(all_lines), height=300, label_visibility="collapsed")
 
                 # --- Quick Change Summary ---
                 st.markdown('<div class="part-header">Quick Change Report Preview</div>', unsafe_allow_html=True)
