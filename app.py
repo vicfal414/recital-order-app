@@ -2,7 +2,6 @@ import json
 import random
 import streamlit as st
 import pandas as pd
-from io import StringIO
 from typing import List, Dict
 
 # --- Page Config ---
@@ -114,50 +113,107 @@ def get_student_gap(sequence: List[Dict], student_name: str) -> int:
     return 999
 
 
-def is_valid_addition(sequence: List[Dict], routine: Dict,
-                      part_length: int = None) -> bool:
+def passes_base_rules(sequence: List[Dict], routine: Dict) -> bool:
     """
-    Check whether a routine can be appended to the current sequence.
-
-    Extra constraint: TOT-style routines must land in the first half of
-    their part (position < part_length // 2).  part_length should be the
-    estimated total length of the part being built.
+    Returns True if the routine satisfies the two hard scheduling rules:
+      1. No back-to-back same style (SOLOs are exempt).
+      2. Every student has at least MIN_GAP_SIZE routines since their last appearance.
+    Does NOT enforce the TOT placement preference — that is handled by fill_part.
     """
     if sequence:
-        previous = sequence[-1]
-        # No back-to-back same style (except SOLO)
-        if routine['style'] == previous['style'] and routine['style'] != "SOLO":
+        if routine['style'] == sequence[-1]['style'] and routine['style'] != "SOLO":
             return False
-
-    # Student spacing
     for student in routine['classList']:
         if get_student_gap(sequence, student) < MIN_GAP_SIZE:
             return False
-
-    # TOT must be in the first half of the part
-    if routine['style'] == 'TOT' and part_length is not None:
-        if len(sequence) >= part_length // 2:
-            return False
-
     return True
 
 
+def fill_part(
+    fixed_start: List[Dict],
+    pool: List[Dict],
+    target_size: int,
+    tot_cutoff: int,
+    adult_tap: Dict = None,
+    adult_tap_slot: int = None,
+) -> tuple:
+    """
+    Build one part of the recital.
+
+    Parameters
+    ----------
+    fixed_start   : classes already locked into the front (e.g. [opening, teen_tap])
+    pool          : available classes to draw from (not mutated — a copy is used)
+    target_size   : total number of slots in this part (not counting the senior_jazz anchor)
+    tot_cutoff    : 0-based index; TOT classes are preferred before this position,
+                    but placed after it only as a last resort (never hard-blocked)
+    adult_tap     : if provided, must be inserted at adult_tap_slot
+    adult_tap_slot: 0-based index where adult_tap is forced in (e.g. 20 for show slot 21)
+
+    Returns
+    -------
+    (part, leftover_pool, success)
+    """
+    part      = list(fixed_start)
+    remaining = list(pool)
+
+    while len(part) < target_size:
+        pos = len(part)
+
+        # Insert the adult_tap anchor at its reserved slot
+        if adult_tap is not None and pos == adult_tap_slot:
+            part.append(adult_tap)
+            continue
+
+        in_first_half = pos < tot_cutoff
+
+        # Split valid candidates into TOT and non-TOT
+        valid_tot     = []
+        valid_non_tot = []
+        for i, c in enumerate(remaining):
+            if passes_base_rules(part, c):
+                if c['style'] == 'TOT':
+                    valid_tot.append((i, c))
+                else:
+                    valid_non_tot.append((i, c))
+
+        if not valid_tot and not valid_non_tot:
+            # Completely stuck — signal failure so the outer loop retries
+            return part, remaining, False
+
+        if in_first_half and valid_tot:
+            # Actively prefer TOT while we're still in the first half
+            chosen_i, chosen = random.choice(valid_tot)
+        elif valid_non_tot:
+            # Normal slot: any valid non-TOT class
+            chosen_i, chosen = random.choice(valid_non_tot)
+        else:
+            # Past the cutoff but only TOT classes are valid — place with a warning
+            chosen_i, chosen = random.choice(valid_tot)
+
+        part.append(chosen)
+        remaining.pop(chosen_i)
+
+    return part, remaining, True
+
+
 def generate_schedule(routines: List[Dict], max_attempts: int = 5000):
-    def pull(name_fragment, source_list):
-        for i, r in enumerate(source_list):
-            if name_fragment.lower() in r['className'].lower():
-                return source_list.pop(i)
+    def pull(fragment, src):
+        frag = fragment.lower()
+        for i, r in enumerate(src):
+            if frag in r['className'].lower():
+                return src.pop(i)
         return None
 
-    for attempt in range(max_attempts):
+    for _ in range(max_attempts):
         pool = routines[:]
         random.shuffle(pool)
 
-        opening     = pull("Opening",             pool)
-        teen_tap    = pull("TEEN/JR. COMP TAP",   pool)
-        production  = pull("Production",           pool)
-        senior_jazz = pull("SENIOR COMP JAZZ",     pool)
-        adult_tap   = pull("ADULT TAP",            pool)
+        opening     = pull("Opening",           pool)
+        teen_tap    = pull("TEEN/JR. COMP TAP", pool)
+        production  = pull("Production",        pool)
+        senior_jazz = pull("SENIOR COMP JAZZ",  pool)
+        adult_tap   = pull("ADULT TAP",         pool)
 
         if not all([opening, teen_tap, production, senior_jazz, adult_tap]):
             return None, (
@@ -166,111 +222,42 @@ def generate_schedule(routines: List[Dict], max_attempts: int = 5000):
                 "Please check your data file."
             )
 
+        total   = len(routines)
+        p1_size = total // 2      # number of slots in Part 1
+        p2_size = total - p1_size  # slots in Part 2 (senior_jazz added separately after)
+
         # ── Part 1 ──────────────────────────────────────────────────────────
-        # Fixed: opening (pos 0), teen_tap (pos 1)
-        # TOT classes must appear before the halfway mark of Part 1.
-        # We don't know the exact final length yet, so split the remaining
-        # pool intelligently: send half the TOT classes to Part 1 so they
-        # have a realistic chance of landing early.
+        # Slot 0 = opening, slot 1 = teen_tap, then fill freely to p1_size.
+        # TOT preference: first half of Part 1, i.e. index < p1_size // 2.
+        p1_tot_cutoff = p1_size // 2
 
-        tot_pool     = [c for c in pool if c['style'] == 'TOT']
-        non_tot_pool = [c for c in pool if c['style'] != 'TOT']
-        random.shuffle(tot_pool)
-        random.shuffle(non_tot_pool)
-
-        total_count = len(routines)
-        half_point  = total_count // 2
-
-        # Rough Part 1 length = half_point (includes opening + teen_tap)
-        p1_length_estimate = half_point
-
-        # Split TOT classes roughly evenly across both parts
-        tot_for_p1 = tot_pool[: len(tot_pool) // 2]
-        tot_for_p2 = tot_pool[len(tot_pool) // 2 :]
-
-        p1_candidates = tot_for_p1 + non_tot_pool[: half_point - 2 - len(tot_for_p1)]
-        p2_candidates = (
-            tot_for_p2
-            + non_tot_pool[half_point - 2 - len(tot_for_p1):]
+        part1, leftover, ok1 = fill_part(
+            fixed_start=[opening, teen_tap],
+            pool=pool,
+            target_size=p1_size,
+            tot_cutoff=p1_tot_cutoff,
         )
-        random.shuffle(p1_candidates)
-        random.shuffle(p2_candidates)
-
-        part1 = [opening, teen_tap]
-        success_p1 = True
-
-        while len(part1) < half_point:
-            found = False
-            for i, candidate in enumerate(p1_candidates):
-                if is_valid_addition(part1, candidate,
-                                     part_length=p1_length_estimate):
-                    part1.append(p1_candidates.pop(i))
-                    found = True
-                    break
-            if not found:
-                # If we still have TOT candidates blocking us past the halfway
-                # mark, fall back to any non-TOT candidate ignoring the TOT rule
-                fallback_found = False
-                for i, candidate in enumerate(p1_candidates):
-                    if candidate['style'] != 'TOT' and is_valid_addition(
-                            part1, candidate):
-                        part1.append(p1_candidates.pop(i))
-                        fallback_found = True
-                        break
-                if not fallback_found:
-                    success_p1 = False
-                    break
-
-        if not success_p1:
+        if not ok1:
             continue
-
-        # Any Part 1 candidates that didn't fit go back into Part 2 pool
-        p2_candidates = p1_candidates + p2_candidates
 
         # ── Part 2 ──────────────────────────────────────────────────────────
-        # Fixed: production (pos 0), adult_tap (pos 20), senior_tap (last)
-        # TOT classes must appear before the halfway mark of Part 2.
+        # Slot 0 = production, slot 20 = adult_tap, last = senior_jazz (appended below).
+        # p2_size includes production + regular slots + adult_tap slot.
+        # TOT preference: first half of Part 2, i.e. index < p2_size // 2.
+        p2_tot_cutoff = p2_size // 2
 
-        # Estimate Part 2 length = everything left + adult_tap + senior_tap
-        p2_length_estimate = len(p2_candidates) + 3  # production + adult_tap + senior_tap
-
-        part2 = [production]
-        success_p2 = True
-
-        while p2_candidates:
-            current_slot = len(part2) + 1   # 1-indexed position about to be filled
-            if current_slot == 21:
-                part2.append(adult_tap)
-                continue
-
-            found = False
-            for i, candidate in enumerate(p2_candidates):
-                if is_valid_addition(part2, candidate,
-                                     part_length=p2_length_estimate):
-                    part2.append(p2_candidates.pop(i))
-                    found = True
-                    break
-
-            if not found:
-                # Relax TOT constraint as fallback (prefer not to, but don't fail)
-                fallback_found = False
-                for i, candidate in enumerate(p2_candidates):
-                    if candidate['style'] != 'TOT' and is_valid_addition(
-                            part2, candidate):
-                        part2.append(p2_candidates.pop(i))
-                        fallback_found = True
-                        break
-                if not fallback_found:
-                    success_p2 = False
-                    break
-
-        if not success_p2:
+        part2, _, ok2 = fill_part(
+            fixed_start=[production],
+            pool=leftover,
+            target_size=p2_size,
+            tot_cutoff=p2_tot_cutoff,
+            adult_tap=adult_tap,
+            adult_tap_slot=20,   # 0-based → show position 21
+        )
+        if not ok2:
             continue
 
-        # Ensure adult_tap is in position 21 if not already inserted
-        if adult_tap not in part2:
-            part2.append(adult_tap)
-
+        # Senior Jazz is always the final number
         part2.append(senior_jazz)
 
         return add_order_to_recital({"Part 1": part1, "Part 2": part2}), None
@@ -285,48 +272,43 @@ def add_order_to_recital(data: Dict) -> Dict:
     current_order = 1
     for part in ["Part 1", "Part 2"]:
         if part in data and isinstance(data[part], list):
-            updated_part = []
+            updated = []
             for item in data[part]:
-                updated_part.append({
+                updated.append({
                     "order":     current_order,
                     "className": item.get("className"),
                     "style":     item.get("style"),
                     "classList": item.get("classList"),
                 })
                 current_order += 1
-            data[part] = updated_part
+            data[part] = updated
     return data
 
 
-def check_tot_placement(result: Dict):
-    """
-    Return a list of warning strings for any TOT class that ended up in
-    the second half of its part.
-    """
+def check_tot_placement(result: Dict) -> List[str]:
+    """Return warning strings for any TOT class in the second half of its part."""
     warnings = []
     for part_name in ("Part 1", "Part 2"):
         routines = result[part_name]
-        cutoff = len(routines) // 2
-        for r in routines:
-            # order is 1-indexed; convert to 0-indexed for comparison
-            if r["style"] == "TOT" and (r["order"] - 1) % len(routines) >= cutoff:
+        cutoff   = len(routines) // 2
+        for idx, r in enumerate(routines):
+            if r["style"] == "TOT" and idx >= cutoff:
                 warnings.append(
                     f"{part_name} #{r['order']}: {r['className']} "
-                    f"(TOT in second half — position {r['order']} of {len(routines)})"
+                    f"(position {idx + 1} of {len(routines)} — past midpoint {cutoff})"
                 )
     return warnings
 
 
 def generate_quick_change_report(order_data: Dict) -> str:
-    lines = []
-    lines.append("RECITAL QUICK CHANGE REPORT (2026)")
-    lines.append("==================================")
-    lines.append("Validation Rules:")
-    lines.append(f"1. Minimum Enforced Gap: {MIN_GAP_SIZE} routines in between.")
-    lines.append("2. Report Flag: Any gap of 4 or less routines.")
-    lines.append(
-        "   (Note: A gap of 3 or 4 is VALID but tight. A gap < 3 is INVALID.)\n"
-    )
+    lines = [
+        "RECITAL QUICK CHANGE REPORT (2026)",
+        "==================================",
+        "Validation Rules:",
+        f"1. Minimum Enforced Gap: {MIN_GAP_SIZE} routines in between.",
+        "2. Report Flag: Any gap of 4 or less routines.",
+        "   (Note: A gap of 3 or 4 is VALID but tight. A gap < 3 is INVALID.)\n",
+    ]
 
     def scan_part(part_name, routine_list):
         lines.append(f"--- {part_name} ---")
@@ -334,20 +316,16 @@ def generate_quick_change_report(order_data: Dict) -> str:
         for i, routine in enumerate(routine_list):
             for student in routine['classList']:
                 for prev_i in range(i - 1, -1, -1):
-                    prev_routine = routine_list[prev_i]
-                    if student in prev_routine['classList']:
+                    prev = routine_list[prev_i]
+                    if student in prev['classList']:
                         gap = i - prev_i - 1
                         if gap <= 4:
                             count += 1
-                            status = (
-                                "VALID (Tight)"
-                                if gap >= MIN_GAP_SIZE
-                                else "**INVALID/ERROR**"
-                            )
+                            status = "VALID (Tight)" if gap >= MIN_GAP_SIZE else "**INVALID/ERROR**"
                             lines.append(f"Student: {student}")
                             lines.append(f"  Status: {status}")
                             lines.append(f"  Gap:    {gap} numbers in between")
-                            lines.append(f"  FROM:   #{prev_i+1} {prev_routine['className']}")
+                            lines.append(f"  FROM:   #{prev_i+1} {prev['className']}")
                             lines.append(f"  TO:     #{i+1} {routine['className']}")
                             lines.append("-" * 40)
                         break
@@ -372,7 +350,7 @@ uploaded_file = st.file_uploader("Upload your recital data file (JSON)", type=["
 
 if uploaded_file:
     try:
-        data = json.load(uploaded_file)
+        data      = json.load(uploaded_file)
         tot_count = sum(1 for r in data if r.get("style") == "TOT")
         st.markdown(
             f'<div class="success-box">✓ File loaded — <strong>{len(data)} routines</strong> found'
@@ -385,26 +363,19 @@ if uploaded_file:
                 result, error = generate_schedule(data)
 
             if error:
-                st.markdown(
-                    f'<div class="error-box">⚠️ {error}</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div class="error-box">⚠️ {error}</div>', unsafe_allow_html=True)
             else:
-                json_output   = json.dumps(
-                    {"Part 1": result["Part 1"], "Part 2": result["Part 2"]}, indent=4
-                )
+                json_output   = json.dumps({"Part 1": result["Part 1"], "Part 2": result["Part 2"]}, indent=4)
                 report_output = generate_quick_change_report(result)
                 has_invalid   = "**INVALID/ERROR**" in report_output
                 tot_warnings  = check_tot_placement(result)
 
-                # ── Status banners ──────────────────────────────────────────
+                # ── Status banners ─────────────────────────────────────────
                 if has_invalid:
                     st.markdown(
-                        '<div class="error-box">'
-                        '⚠️ <strong>Invalid Quick Change Detected!</strong> This schedule contains '
-                        'one or more students with an invalid gap between performances. '
-                        'Please click <em>Generate Schedule</em> again to try a new order.'
-                        '</div>',
+                        '<div class="error-box">⚠️ <strong>Invalid Quick Change Detected!</strong> '
+                        'This schedule contains one or more students with an invalid gap between '
+                        'performances. Please click <em>Generate Schedule</em> again.</div>',
                         unsafe_allow_html=True,
                     )
                 else:
@@ -415,17 +386,15 @@ if uploaded_file:
                     )
 
                 if tot_warnings:
-                    warning_items = "".join(f"<li>{w}</li>" for w in tot_warnings)
+                    items = "".join(f"<li>{w}</li>" for w in tot_warnings)
                     st.markdown(
-                        f'<div class="warning-box">'
-                        f'⚠️ <strong>TOT Placement Notice:</strong> The following TOT classes '
-                        f'could not be placed in the first half of their part. '
-                        f'Consider regenerating.<ul>{warning_items}</ul>'
-                        f'</div>',
+                        f'<div class="warning-box">⚠️ <strong>TOT Placement Notice:</strong> '
+                        f'The following TOT classes could not be placed in the first half of their '
+                        f'part. Consider regenerating.<ul>{items}</ul></div>',
                         unsafe_allow_html=True,
                     )
 
-                # ── Downloads ───────────────────────────────────────────────
+                # ── Downloads ──────────────────────────────────────────────
                 col1, col2 = st.columns(2)
                 with col1:
                     st.download_button(
@@ -442,60 +411,41 @@ if uploaded_file:
                         mime="text/plain",
                     )
 
-                # ── Schedule display ────────────────────────────────────────
+                # ── Schedule tables ────────────────────────────────────────
                 def make_rows(part_key):
                     part      = result[part_key]
                     half_mark = len(part) // 2
                     rows = []
-                    for r in part:
-                        pos       = r["order"]
-                        part_pos  = part.index(r)   # 0-indexed within the part
-                        is_tot    = r["style"] == "TOT"
-                        in_second = part_pos >= half_mark
+                    for idx, r in enumerate(part):
+                        is_tot = r["style"] == "TOT"
                         tag = ""
-                        if is_tot and in_second:
+                        if is_tot and idx >= half_mark:
                             tag = " ⚠️ TOT (2nd half)"
                         elif is_tot:
                             tag = " ✓ TOT"
                         rows.append({
-                            "#":          pos,
+                            "#":          r["order"],
                             "Class Name": r["className"] + tag,
                             "Style":      r["style"],
                         })
                     return rows
 
                 st.markdown('<div class="part-header">Part 1</div>', unsafe_allow_html=True)
-                st.dataframe(
-                    pd.DataFrame(make_rows("Part 1")),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.dataframe(pd.DataFrame(make_rows("Part 1")), use_container_width=True, hide_index=True)
 
                 st.markdown('<div class="part-header">Part 2</div>', unsafe_allow_html=True)
-                st.dataframe(
-                    pd.DataFrame(make_rows("Part 2")),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.dataframe(pd.DataFrame(make_rows("Part 2")), use_container_width=True, hide_index=True)
 
-                # ── Copyable list ───────────────────────────────────────────
+                # ── Copyable list ──────────────────────────────────────────
                 st.markdown('<div class="part-header">Copy as List</div>', unsafe_allow_html=True)
-                all_lines = ["--- Part 1 ---"]
+                all_lines  = ["--- Part 1 ---"]
                 all_lines += [f"{r['order']}. {r['className']}" for r in result["Part 1"]]
                 all_lines += ["", "--- Part 2 ---"]
                 all_lines += [f"{r['order']}. {r['className']}" for r in result["Part 2"]]
-                st.text_area(
-                    "",
-                    value="\n".join(all_lines),
-                    height=300,
-                    label_visibility="collapsed",
-                )
+                st.text_area("", value="\n".join(all_lines), height=300, label_visibility="collapsed")
 
-                # ── Quick change report preview ─────────────────────────────
-                st.markdown(
-                    '<div class="part-header">Quick Change Report Preview</div>',
-                    unsafe_allow_html=True,
-                )
+                # ── Quick change preview ───────────────────────────────────
+                st.markdown('<div class="part-header">Quick Change Report Preview</div>', unsafe_allow_html=True)
                 st.text(report_output)
 
     except json.JSONDecodeError:
